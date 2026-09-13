@@ -1,0 +1,29 @@
+[Unit]
+Description=pkmkv.com 电影推荐列表监控 + Resend 邮件提醒
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ---- 按你的实际情况修改下面几行 ----
+User=root
+WorkingDirectory=/root/movie-notify
+Environment=RESEND_API_KEY=
+ExecStart=/usr/bin/python3 /root/movie-notify/movie_notify.py
+ExecStartPre=/bin/sleep 3
+Restart=always
+RestartSec=30
+
+# 日志由脚本自己写入 logs/，这里只保留少量 stdout 供 journal 查看
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=movie-notify
+
+# 安全加固（按需）
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/root/movie-notify
+
+[Install]
+WantedBy=multi-user.target

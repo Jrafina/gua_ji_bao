@@ -1,0 +1,20 @@
+{
+  "url": "https://www.pkmkv.com/",
+  "count": 6,
+  "tz": "Asia/Shanghai",
+  "schedule_hours": [8, 12, 18, 0],
+  "from": "notify@1795857.xyz",
+  "to": ["1795857787@qq.com"],
+  "subject_prefix": "[pkmkv 更新]",
+  "resend_base_url": "https://api.resend.com/emails",
+  "resend_api_key": "",
+  "dry_run": false,
+  "notify_on_order_change": false,
+  "cover_image_in_email": true,
+  "http_timeout": 25,
+  "max_retries": 3,
+  "retry_backoff": 5,
+  "state_file": "state.json",
+  "history_file": "history/history.jsonl",
+  "log_file": "logs/movie_notify.log"
+}

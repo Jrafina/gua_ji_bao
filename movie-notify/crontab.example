@@ -1,0 +1,12 @@
+# crontab 方案（与 systemd 二选一，不要同时启用）
+#
+# 用法：
+#   crontab /root/movie-notify/crontab.example
+# 或：
+#   crontab -e   # 然后把下面 4 行粘进去
+#
+# 时区：crontab 默认跟随系统时区。本机是 UTC，所以北京时间 08:00 = UTC 00:00。
+# 先执行：sudo timedatectl set-timezone Asia/Shanghai   （推荐，最省心）
+#
+# 下面这组按「系统时区 = Asia/Shanghai」编写：
+0 8,12,18,0 * * * cd /root/movie-notify && RESEND_API_KEY= /usr/bin/python3 movie_notify.py --once >> logs/cron.log 2>&1
