@@ -1,0 +1,17 @@
+[Unit]
+Description=TG Storage Pool Web (FastAPI)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tgpool/app
+EnvironmentFile=/opt/tgpool/tgpool.env
+ExecStart=/opt/tgpool/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8080 --workers 1
+Restart=always
+RestartSec=3
+# 低内存机器限制, 防止 OOM 拖垮整机
+MemoryMax=350M
+
+[Install]
+WantedBy=multi-user.target
