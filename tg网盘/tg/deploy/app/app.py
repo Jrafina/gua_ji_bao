@@ -51,6 +51,13 @@ CACHE_SCRIPT = Path(os.environ.get(
     "TG_CACHE_SCRIPT",
     str(Path(__file__).resolve().parent.parent / "tools" / "clean_cache.py"),
 ))
+# 找回密码工具（/pass 提示用户在服务器上怎么查）
+PASS_SCRIPT = Path(os.environ.get(
+    "TG_PASS_SCRIPT",
+    str(Path(__file__).resolve().parent.parent / "tools" / "show_password.py"),
+))
+# nginx 对外 HTTPS 端口（部署脚本写进 tgpool.env），/pass 用来拼出网页地址
+NGINX_PORT = os.environ.get("TG_NGINX_PORT", "8443").strip() or "8443"
 
 if not BOT_TOKEN:
     raise SystemExit("缺少环境变量 TG_BOT_TOKEN")
@@ -181,19 +188,47 @@ def folder_scope(conn, fid) -> list:
     return [r["id"] for r in rows]
 
 
+async def _tg_delete_messages(chat_id, mids) -> int:
+    """从 Telegram 侧删除一批消息，返回确认删掉的条数。
+
+    优先用 deleteMessages（一次最多 100 条）——池子里一个目录动辄上千个文件，
+    逐条 deleteMessage 既慢又容易撞限流；批量整体失败（老 API / 权限）才退回逐条。
+    """
+    ids = [int(m) for m in mids if m]
+    done = 0
+    for i in range(0, len(ids), 100):
+        batch = ids[i:i + 100]
+        r = await _tg("deleteMessages", chat_id=chat_id, message_ids=batch)
+        if r.get("ok"):
+            done += len(batch)
+            continue
+        log.warning("deleteMessages 批量失败（%d 条）：%s，改为逐条删除",
+                    len(batch), r.get("description"))
+        for mid in batch:
+            rr = await _tg("deleteMessage", chat_id=chat_id, message_id=mid)
+            if rr.get("ok"):
+                done += 1
+            else:
+                log.warning("deleteMessage 失败 message_id=%s: %s", mid, rr.get("description"))
+    return done
+
+
 async def delete_messages(rows) -> None:
-    """从 Telegram 侧删除消息（失败只记日志，不阻断）"""
+    """从 Telegram 侧删除消息（失败只记日志，不阻断）。
+
+    按每条记录自带的 chat_id 删除（从别的会话发进池子的文件，原消息不在存储池会话里）；
+    记录里没有 chat_id 列时退回全局 CHAT_ID。
+    """
+    by_chat = {}
     for r in rows:
         mid = r["message_id"]
         if not mid:
             continue
-        try:
-            resp = await client.post(
-                f"{API}/deleteMessage", data={"chat_id": CHAT_ID, "message_id": mid}
-            )
-            api_ok(resp.json())
-        except Exception as e:  # noqa: BLE001
-            log.warning("deleteMessage failed file_id=%s: %s", r["id"], e)
+        cid = (r["chat_id"] if "chat_id" in r.keys() else None) or CHAT_ID
+        by_chat.setdefault(str(cid), []).append(mid)
+    for cid, mids in by_chat.items():
+        n = await _tg_delete_messages(cid, mids)
+        log.info("delete: chat=%s 请求 %d 条，Telegram 确认 %d 条", cid, len(mids), n)
 
 
 # ---------------- 变更日志（灾备核心） ----------------
@@ -583,7 +618,8 @@ async def move_file(fid: int, payload: dict = Body(...)):
 @app.delete("/api/files/{fid}", dependencies=[Depends(auth)])
 async def delete_file(fid: int):
     with db() as conn:
-        row = conn.execute("SELECT id,message_id FROM files WHERE id=?", (fid,)).fetchone()
+        row = conn.execute(
+            "SELECT id,message_id,chat_id FROM files WHERE id=?", (fid,)).fetchone()
         if not row:
             raise HTTPException(404, "not found")
         await delete_messages([row])
@@ -937,6 +973,13 @@ PAGE_SIZE = 8                 # 每页列出的文件条数
 MAX_HITS = 200                # 一次搜索最多收集的候选数
 SEARCH_TTL = 1800             # 搜索结果在内存里保留 30 分钟（翻页用）
 SEARCH_CACHE = {}             # token -> {"kw", "items", "ts"}
+# /rm 是唯一不可逆的操作：删文件夹要先点一次「确认删除」，加 -f 才跳过。
+# 待确认的操作放在内存里（不落盘 —— 重启后按钮失效是好事，不会误删）。
+RM_PENDING = {}               # token -> {"id","path","files","folders","size","ts"}
+RM_TTL = 600                  # 确认按钮 10 分钟内有效
+# 是否允许在聊天里查网页密码（/pass）。白名单会话本来就能取走池子里的任何文件，
+# 所以默认开着；介意的话设 TG_BOT_SHOW_PASS=0。
+SHOW_PASS = os.environ.get("TG_BOT_SHOW_PASS", "1") not in ("0", "false", "no", "")
 # 云端备份注册表（tools/backup_index.py 每次上传成功追加一条）。
 # 备份包是灾备基础设施，不进池子索引 —— 否则网页/bot 里的删除会连带删掉 Telegram 上的异地副本。
 # /backups 只读这份注册表来列出与取回。
@@ -956,8 +999,15 @@ HELP_TEXT = """TG 存储池 · 命令一览
    例：/ls  /ls /工作/2026
 
 /get 编号        按编号取回文件（编号来自搜索结果）
+/move 源 目标    移动文件或文件夹，目标留空 = 挪到根目录
+   例：/move /工作/2026 /归档　/move "/我的 报告"
+/rm 路径         删除文件；删文件夹会先问一句再动手
+   例：/rm /工作/2026/报表.pdf　/rm /工作/2026　/rm #1234
+   /rm -f 路径    跳过确认直接删
+
 /backups         列出云端索引备份包，点编号即可取回
 /stats           池子统计
+/pass            忘记网页密码时把账号密码捞回来
 /help            显示本帮助
 
 搜索命中后，点结果下方的数字按钮即可把文件取回本对话。
@@ -967,6 +1017,25 @@ HELP_TEXT = """TG 存储池 · 命令一览
 默认放进 /收件箱；在说明里写一行路径就放进该目录。
    例：发文件时说明写 /工作/2026
 目录不存在会自动创建；同一个文件不会重复收录。"""
+
+RM_USAGE = """用法：/rm [-f] [-dir|-file] 路径
+
+/rm /工作/2026/报表.pdf   删除一个文件
+/rm /工作/2026            删除整个文件夹及其全部内容（先确认）
+/rm #1234                 按编号删（编号来自 /ls、/search）
+
+  -f      跳过确认，直接删
+  -dir    只当文件夹处理　-file  只当文件处理
+          （同名文件和文件夹同时存在时才需要）"""
+
+MOVE_USAGE = """用法：/move '源路径' '目标文件夹'
+
+/move /工作/2026 /归档     把 /工作/2026 挪到 /归档 下
+/move /报表模板.docx /模板  移动单个文件
+/move "/我的 报告"          只写源 = 挪到根目录
+
+源可以是文件或文件夹；目标目录不存在会自动创建。
+路径里含空格时用引号包起来。"""
 
 
 def _human(n) -> str:
@@ -1043,6 +1112,87 @@ def _resolve_path(conn, path: str):
             return None, f"路径不存在：{path}"
         cur = row["id"]
     return cur, None
+
+
+# ---------------- /rm · /move 的路径解析 ----------------
+def _norm_path(path: str) -> str:
+    """'/a//b/' -> '/a/b'；'' 与 '/' 都归一化成根目录 '/'"""
+    return "/" + "/".join(s for s in (path or "").split("/") if s)
+
+
+def _split_args(raw: str) -> list:
+    """按「引号优先」切分用户输入：'a b' "c" -> ['a b', 'c']；无引号则按空白切。
+
+    Telegram 不会替我们保留 argv，路径里有空格时用户会用引号包起来；
+    手机输入法常把引号变成中文全角，所以一并接受。
+    """
+    pairs = {"'": "'", '"': '"', "“": "”", "‘": "’", "「": "」"}
+    out, buf, quote = [], [], None
+    for ch in raw:
+        if quote:
+            if ch == pairs[quote]:
+                quote = None
+            else:
+                buf.append(ch)
+        elif ch in pairs:
+            quote = ch
+        elif ch.isspace():
+            if buf:
+                out.append("".join(buf))
+                buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
+def _resolve_node(conn, path: str, want: str = ""):
+    """把 /a/b/c 解析成 (类型, id)：类型是 'folder' 或 'file'，根目录是 ('folder', None)。
+
+    want='folder' / 'file' 时只认该类型；同名时默认目录优先（回复里会写明删的是哪个，
+    要删同名文件加 -file）。找不到返回 (None, None, 错误信息)。
+    """
+    p = _norm_path(path)
+    if p == "/":
+        if want == "file":
+            return None, None, "根目录不是文件，没法按文件处理"
+        return "folder", None, None
+    folder_id, _ = _resolve_path(conn, p)          # 目录精确匹配（目录存在时一定命中）
+    parent, name = p.rsplit("/", 1)
+    pfid, perr = _resolve_path(conn, parent or "/")
+    file_id = None
+    if not perr:
+        row = conn.execute("SELECT id FROM files WHERE folder_id IS ? AND name=?",
+                           (pfid, name)).fetchone()
+        file_id = row["id"] if row else None
+    if want == "folder":
+        if folder_id is None:
+            return None, None, f"目录不存在：{p}"
+        return "folder", folder_id, None
+    if want == "file":
+        if file_id is None:
+            return None, None, f"文件不存在：{p}"
+        return "file", file_id, None
+    if folder_id is not None:
+        return "folder", folder_id, None
+    if file_id is not None:
+        return "file", file_id, None
+    return None, None, f"路径不存在：{p}"
+
+
+def _same_name_file(conn, path: str):
+    """同层是否还有同名文件（同名时 /rm 默认删目录，这里用来提示清楚）"""
+    p = _norm_path(path)
+    if p == "/":
+        return None
+    parent, name = p.rsplit("/", 1)
+    pfid, perr = _resolve_path(conn, parent or "/")
+    if perr:
+        return None
+    return conn.execute("SELECT id FROM files WHERE folder_id IS ? AND name=?",
+                        (pfid, name)).fetchone()
+
 
 
 # ---------------- 反向上传：把用户发给 bot 的文件登记进池子 ----------------
@@ -1309,7 +1459,8 @@ async def _reply_ls(chat_id, path: str):
             lines.append(f"  {f_['name']}   {_human(f_['size'])} · #{f_['id']}")
     if not subs and not files_:
         lines.append("（空目录）")
-    lines += ["", "取文件：/get 编号　进目录：/ls 完整路径"]
+    lines += ["", "取文件：/get 编号　进目录：/ls 完整路径",
+              "删：/rm 路径　移：/move 源路径 目标目录"]
     await _tg("sendMessage", chat_id=chat_id, text="\n".join(lines)[:4000],
               disable_web_page_preview=True)
 
@@ -1337,6 +1488,278 @@ async def _send_file(chat_id, fid: int) -> bool:
     return False
 
 
+# ---------------- /rm：在聊天里删文件 / 删目录 ----------------
+# 与网页端的删除走同一套 journal 事件（del / rmd），所以删完依然能被
+# rebuild_index.py 完整重放 —— 这是池子敢让人随手删的前提。
+# 顺序固定：先删 Telegram 侧消息，再删索引，最后写 journal。
+async def _do_delete_file(cid, fid: int) -> None:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id,name,size,message_id,chat_id,folder_id FROM files WHERE id=?",
+            (fid,)).fetchone()
+        if not row:
+            await _tg("sendMessage", chat_id=cid, text=f"文件 #{fid} 不存在（可能已被删除）")
+            return
+        where = path_of(conn, row["folder_id"])
+        await delete_messages([row])
+        conn.execute("DELETE FROM files WHERE id=?", (fid,))
+        conn.commit()
+    jlog({"t": "del", "id": fid, "name": row["name"], "size": row["size"], "path": where})
+    log.info("bot: /rm 删除文件 %s #%s (%s)", row["name"], fid, where)
+    await _tg("sendMessage", chat_id=cid,
+              text=f"已删除文件\n\n{row['name']}\n{_human(row['size'])} · {where}\n\n"
+                   f"Telegram 上的原消息已一并清除，无法找回。")
+
+
+async def _do_delete_folder(cid, fid: int, edit_msg=None) -> None:
+    """递归删除目录。edit_msg=(chat_id, message_id) 时把那条消息改成进度/结果。"""
+    with db() as conn:
+        ids = folder_scope(conn, fid)
+        if not ids:
+            await _tg("sendMessage", chat_id=cid, text="这个目录已经不存在了（可能已被删除）")
+            return
+        ph = ",".join("?" * len(ids))
+        rows = conn.execute(
+            f"SELECT id,name,size,message_id,chat_id FROM files"
+            f" WHERE folder_id IN ({ph})", ids).fetchall()
+        target = path_of(conn, fid)
+        n, nf = len(rows), len(ids)
+        total = sum(r["size"] or 0 for r in rows)
+
+        if edit_msg:
+            await _tg("editMessageText", chat_id=edit_msg[0], message_id=edit_msg[1],
+                      text=f"正在删除 {target}（{n} 个文件）…")
+        elif n > 100:      # 大目录先吱一声，别让用户以为卡住了
+            await _tg("sendMessage", chat_id=cid,
+                      text=f"正在删除 {target}（{n} 个文件）…")
+
+        await delete_messages(rows)
+        conn.execute(f"DELETE FROM files WHERE folder_id IN ({ph})", ids)
+        conn.execute(f"DELETE FROM folders WHERE id IN ({ph})", ids)
+        conn.commit()
+    jlog({"t": "rmd", "path": target, "recursive": True, "files": n, "folders": nf})
+    log.info("bot: /rm 删除目录 %s：%d 个子目录 / %d 个文件", target, nf - 1, n)
+
+    text = (f"已删除文件夹\n\n{target}\n"
+            f"{_human(total)} · {n} 个文件 · {nf - 1} 个子目录\n\n"
+            f"Telegram 上的原消息已一并清除，无法找回。")
+    if edit_msg:
+        r = await _tg("editMessageText", chat_id=edit_msg[0], message_id=edit_msg[1],
+                      text=text, reply_markup={"inline_keyboard": []})
+        if r.get("ok"):
+            return
+    await _tg("sendMessage", chat_id=cid, text=text)
+
+
+async def _reply_rm(cid, body: str) -> None:
+    force, want, paths = False, "", []
+    for a in _split_args(body):
+        if a in ("-f", "--force"):
+            force = True
+        elif a in ("-dir", "--dir", "-d"):
+            want = "folder"
+        elif a in ("-file", "--file"):
+            want = "file"
+        else:
+            paths.append(a)
+    if len(paths) != 1:
+        await _tg("sendMessage", chat_id=cid, text=RM_USAGE)
+        return
+    arg = paths[0]
+
+    if arg.startswith("#") and arg[1:].isdigit():     # /rm #1234 —— 按编号删，最不容易认错
+        with db() as conn:
+            row = conn.execute("SELECT id FROM files WHERE id=?", (int(arg[1:]),)).fetchone()
+        if not row:
+            await _tg("sendMessage", chat_id=cid,
+                      text=f"编号 #{arg[1:]} 不存在（可能已被删除）")
+            return
+        await _do_delete_file(cid, row["id"])
+        return
+
+    with db() as conn:
+        kind, nid, err = _resolve_node(conn, arg, want)
+        if err:
+            await _tg("sendMessage", chat_id=cid, text=f"{err}\n\n{RM_USAGE}")
+            return
+        if kind == "folder" and nid is None:
+            await _tg("sendMessage", chat_id=cid,
+                      text="根目录不能删。要删哪个目录就把完整路径写全，例：/rm /工作/2026")
+            return
+        if kind == "file":
+            await _do_delete_file(cid, nid)
+            return
+
+        target = path_of(conn, nid)
+        ids = folder_scope(conn, nid)
+        ph = ",".join("?" * len(ids))
+        rows = conn.execute(
+            f"SELECT id,size FROM files WHERE folder_id IN ({ph})", ids).fetchall()
+        n, nf = len(rows), len(ids)
+        total = sum(r["size"] or 0 for r in rows)
+        ambiguous = bool(_same_name_file(conn, target))
+
+    if force:
+        await _do_delete_folder(cid, nid)
+        return
+
+    tok = secrets.token_urlsafe(9)[:12]
+    RM_PENDING[tok] = {"id": nid, "path": target, "files": n, "folders": nf,
+                       "size": total, "ts": time.time()}
+    lines = ["要删除整个文件夹吗？", "",
+             f"目录   {target}",
+             f"内容   {nf - 1} 个子目录 · {n} 个文件 · 共 {_human(total)}", ""]
+    if ambiguous:
+        lines.append("（同层还有一个同名文件，这次删的是文件夹；"
+                     "只删文件请加 -file）\n")
+    lines.append("删掉会连 Telegram 上的原消息一起清除，删完无法找回。")
+    lines.append("确认请点下面的按钮（10 分钟内有效）。")
+    kb = {"inline_keyboard": [[
+        {"text": "确认删除", "callback_data": f"r:{tok}:y"},
+        {"text": "取消", "callback_data": f"r:{tok}:n"}]]}
+    await _tg("sendMessage", chat_id=cid, text="\n".join(lines), reply_markup=kb)
+    log.info("bot: /rm 待确认 path=%s files=%d folders=%d", target, n, nf)
+
+
+# ---------------- /move：在聊天里挪文件 / 挪目录 ----------------
+# 目录移动写 journal 的 mvd（{path, new}），文件移动写 mv（{id, path}），
+# 与网页端一致，重建时照旧能还原。
+async def _reply_move(cid, body: str) -> None:
+    args = _split_args(body)
+    if not args or len(args) > 2:
+        await _tg("sendMessage", chat_id=cid, text=MOVE_USAGE)
+        return
+    src = args[0]
+    dst = args[1] if len(args) > 1 else ""
+    sp, dp = _norm_path(src), _norm_path(dst)
+
+    with db() as conn:
+        kind, nid, err = _resolve_node(conn, src)
+        if err:
+            await _tg("sendMessage", chat_id=cid, text=f"{err}\n\n{MOVE_USAGE}")
+            return
+        if kind == "folder" and nid is None:
+            await _tg("sendMessage", chat_id=cid, text="根目录不能移动。")
+            return
+        # 自环检查放在建目录之前：否则会先在源目录里凭空造出一个目标目录
+        if kind == "folder" and (dp == sp or dp.startswith(sp + "/")):
+            await _tg("sendMessage", chat_id=cid,
+                      text=f"不能把 {sp} 挪到它自己或它的子目录（{dp}）里。")
+            return
+
+        made = []
+        target_id, terr = _resolve_path(conn, dp)
+        if terr:
+            # 目标目录不存在就照上传的惯例逐级自动创建（每级都写 journal）
+            parent = "/" + "/".join(dp.split("/")[1:-1])
+            name = dp.rsplit("/", 1)[-1]
+            pfid, perr = _resolve_path(conn, parent or "/")
+            if not perr and conn.execute(
+                    "SELECT 1 FROM files WHERE folder_id IS ? AND name=?",
+                    (pfid, name)).fetchone():
+                await _tg("sendMessage", chat_id=cid,
+                          text=f"目标位置已经有个同名文件：{dp}\n"
+                               f"换个目录名，或者先把那个文件挪走。")
+                return
+            before = {r["id"] for r in conn.execute("SELECT id FROM folders").fetchall()}
+            target_id = _ensure_folder_path(conn, dp)
+            made = sorted(path_of(conn, r["id"]) for r in
+                          conn.execute("SELECT id FROM folders").fetchall()
+                          if r["id"] not in before)
+
+        if kind == "folder":
+            old = path_of(conn, nid)
+            if target_id == nid:
+                await _tg("sendMessage", chat_id=cid,
+                          text=f"{old} 已经在 {dp} 里了，没动。")
+                return
+            if target_id is not None and target_id in folder_scope(conn, nid):
+                await _tg("sendMessage", chat_id=cid,
+                          text="不能把文件夹挪进它自己的子目录里。")
+                return
+            base = old.rsplit("/", 1)[-1]
+            if conn.execute("SELECT 1 FROM folders WHERE parent_id IS ? AND name=? AND id<>?",
+                            (target_id, base, nid)).fetchone():
+                await _tg("sendMessage", chat_id=cid,
+                          text=f"{dp.rstrip('/')}/{base} 已经有同名文件夹了，"
+                               f"先改个名或换个目标目录。")
+                return
+            conn.execute("UPDATE folders SET parent_id=? WHERE id=?", (target_id, nid))
+            conn.commit()
+            new = path_of(conn, nid)
+            ids = folder_scope(conn, nid)
+            ph = ",".join("?" * len(ids))
+            nf = len(ids)
+            n = conn.execute(f"SELECT COUNT(*) c FROM files WHERE folder_id IN ({ph})",
+                             ids).fetchone()["c"]
+        else:
+            row = conn.execute("SELECT name,folder_id FROM files WHERE id=?",
+                               (nid,)).fetchone()
+            if row["folder_id"] == target_id:
+                await _tg("sendMessage", chat_id=cid,
+                          text=f"{src} 已经在 {dp} 里了，没动。")
+                return
+            old = path_of(conn, row["folder_id"])
+            conn.execute("UPDATE files SET folder_id=? WHERE id=?", (target_id, nid))
+            conn.commit()
+            new_dir = path_of(conn, target_id)
+            old = old.rstrip("/") + "/" + row["name"]
+            new = new_dir.rstrip("/") + "/" + row["name"]
+
+    if kind == "folder":
+        jlog({"t": "mvd", "path": old, "new": new, "by": "bot"})
+        text = f"已移动文件夹\n\n{old}  →  {new}\n{n} 个文件 · {nf - 1} 个子目录"
+    else:
+        # journal 约定：mv 的 path 记的是**所在目录**（不是文件全路径），
+        # rebuild_index.py 重放时用它定位 folder_id；写成文件全路径会被当成目录树。
+        jlog({"t": "mv", "id": nid, "path": new_dir, "by": "bot"})
+        text = f"已移动文件\n\n{old}  →  {new}"
+    if made:
+        text += "\n\n（目标目录原本不存在，已自动创建：" + "、".join(made) + "）"
+    log.info("bot: /move %s -> %s", old, new)
+    await _tg("sendMessage", chat_id=cid, text=text)
+
+
+# ---------------- /pass：忘记网页密码时把它捞回来 ----------------
+def _local_ip() -> str:
+    """取本机对外 IP（UDP connect 不发包）；拿不到就退回 127.0.0.1。"""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:  # noqa: BLE001
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+async def _reply_pass(cid) -> None:
+    if not SHOW_PASS:
+        await _tg("sendMessage", chat_id=cid,
+                  text="已经在聊天里关掉了密码查询（TG_BOT_SHOW_PASS=0）。\n\n"
+                       "到服务器上执行下面这行即可：\n"
+                       f"python3 {PASS_SCRIPT}")
+        return
+    ip = _local_ip()
+    text = "\n".join([
+        "网页登录信息",
+        "",
+        f"外网   https://{ip}:{NGINX_PORT}/",
+        f"本机   http://127.0.0.1:8080/",
+        f"账号   {AUTH_USER}",
+        f"密码   {AUTH_PASS or '（TG_AUTH_PASS 没设，任意密码都能进）'}",
+        "",
+        "服务器上随时可查：",
+        f"  python3 {PASS_SCRIPT}",
+        "",
+        "这条消息里有密码，看完可以点下面的按钮把它删掉。",
+    ])
+    kb = {"inline_keyboard": [[{"text": "删掉这条消息", "callback_data": "q"}]]}
+    await _tg("sendMessage", chat_id=cid, text=text, reply_markup=kb)
+    log.info("bot: /pass 已回复网页登录信息")
+
+
 async def _handle_message(msg: dict) -> None:
     chat = msg.get("chat") or {}
     frm = msg.get("from") or {}
@@ -1360,6 +1783,8 @@ async def _handle_message(msg: dict) -> None:
     parts = text.split()
     cmd = parts[0].split("@")[0].lower()
     args = parts[1:]
+    # /move、/rm 的路径里可能带空格和引号，所以额外保留命令后的原始文本
+    body = text.split(None, 1)[1].strip() if len(parts) > 1 else ""
     BOT_STATE["handled"] += 1
 
     if cmd in ("/search", "/s", "/find"):
@@ -1381,6 +1806,15 @@ async def _handle_message(msg: dict) -> None:
             return
         if not await _send_file(cid, int(raw)):
             await _tg("sendMessage", chat_id=cid, text=f"取回 #{raw} 失败，可能已被删除。")
+
+    elif cmd in ("/rm", "/del", "/delete"):
+        await _reply_rm(cid, body)
+
+    elif cmd in ("/move", "/mv"):
+        await _reply_move(cid, body)
+
+    elif cmd in ("/pass", "/pwd", "/password"):
+        await _reply_pass(cid)
 
     elif cmd in ("/backups", "/bk"):
         await _reply_backups(cid)
@@ -1438,6 +1872,27 @@ async def _handle_callback(cb: dict) -> None:
         await _reply_search(cid, cache["kw"], page=int(pg or 0), token=token,
                             edit_msg=(cid, msg.get("message_id")))
 
+    elif data.startswith("r:"):
+        _, tok, act = (data.split(":", 2) + ["", ""])[:3]
+        p = RM_PENDING.pop(tok, None)          # 用完即弃，避免重复点造成二次删除
+        if not p:
+            await _tg("answerCallbackQuery", callback_query_id=cbid,
+                      text="这个确认已经失效，重新发一次 /rm 吧")
+            return
+        if act != "y":
+            await _tg("answerCallbackQuery", callback_query_id=cbid, text="已取消")
+            await _tg("editMessageText", chat_id=cid, message_id=msg.get("message_id"),
+                      text=f"已取消，什么都没删：{p['path']}",
+                      reply_markup={"inline_keyboard": []})
+            return
+        await _tg("answerCallbackQuery", callback_query_id=cbid, text="开始删除…")
+        await _do_delete_folder(cid, p["id"], edit_msg=(cid, msg.get("message_id")))
+
+    elif data == "q":
+        # /pass 那类含敏感内容的消息：点一下就由 bot 自己删掉
+        await _tg("answerCallbackQuery", callback_query_id=cbid, text="已删除")
+        await _tg("deleteMessage", chat_id=cid, message_id=msg.get("message_id"))
+
     else:
         await _tg("answerCallbackQuery", callback_query_id=cbid)
 
@@ -1492,10 +1947,12 @@ async def _bot_poll_loop() -> None:
                 except Exception as e:  # noqa: BLE001
                     log.warning("bot: 处理更新失败 %s: %s", type(e).__name__, e)
 
-            # 顺手清理过期的搜索结果缓存
+            # 顺手清理过期的搜索结果缓存 / 待确认的删除
             now = time.time()
             for k in [k for k, v in SEARCH_CACHE.items() if now - v["ts"] > SEARCH_TTL]:
                 SEARCH_CACHE.pop(k, None)
+            for k in [k for k, v in RM_PENDING.items() if now - v["ts"] > RM_TTL]:
+                RM_PENDING.pop(k, None)
 
         except asyncio.CancelledError:
             log.info("bot: 命令轮询停止")

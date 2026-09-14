@@ -33,7 +33,8 @@ tgpool-deploy/
 └── tools/
     ├── rebuild_index.py       索引重建工具
     ├── backup_index.py        索引备份工具
-    └── clean_cache.py         bot API 本地缓存清理工具
+    ├── clean_cache.py         bot API 本地缓存清理工具
+    └── show_password.py       找回 / 重设网页登录密码（忘记密码时用）
 ```
 
 ---
@@ -206,6 +207,11 @@ bash deploy.sh --yes
 | `/search` 回复重复好几遍 | `tgpool.service` 被改成了多 worker。长轮询必须单进程，恢复成 `--workers 1` |
 | 发文件给 bot 没有收录回复 | 同上先看 `/api/bot/status`。若 `handled` 不涨说明消息没进白名单（把用户 ID 加进 `TG_BOT_ADMIN_IDS`）；若是 `sticker` 或非文件类型，属于设计上不收录；若回复"已经在池子里了"则是按 `file_unique_id` 命中了去重 |
 | 发文件后消息多了一行 `TGPOOL /xxx` | **正常设计**：脚本给原本没有说明的消息补一行 `TGPOOL <路径>`，让 Telegram 侧自带目录信息（便于人工核对）。你原本的说明不会被覆盖 |
+| 忘记网页密码 / 账号密码找不着 | 三条路任选：① Telegram 里发 `/pass`；② 服务器上 `python3 /opt/tgpool/tools/show_password.py`（`--token` 连 bot token 一起看）；③ `python3 /opt/tgpool/tools/show_password.py --reset --yes` 直接换个新的，然后 `systemctl restart tgpool`。脚本是纯标准库，服务挂了也能跑，要用 root |
+| `/rm` 删完能恢复吗 | **不能**。`/rm` 会连 Telegram 上的原消息一起删掉，是真删除。所以删文件夹时 bot 会先列出内容让你点「确认删除」（想跳过加 `-f`）。索引侧照旧写 journal，但消息没了就真没了 |
+| `/move` 的目标目录不存在 | **会自动逐级创建**（和发文件时在说明里写路径一个规矩），回复里会列出新建了哪几级；不想让它建就先手工把目录建出来 |
+| `/move` 报"已经有同名文件夹了" | 目标目录下已有同名目录，改名或换个目标；不会静默覆盖 |
+| `/move` 报"不能挪进它自己的子目录" | 循环保护。先把子目录挪走，或换个目标目录 |
 
 ---
 

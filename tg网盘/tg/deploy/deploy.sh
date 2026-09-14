@@ -20,7 +20,7 @@
 # =============================================================================
 set -uo pipefail
 
-SCRIPT_VER="1.4"
+SCRIPT_VER="1.5"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP="${TG_APP_DIR:-/opt/tgpool}"
 PORT="${TG_NGINX_PORT:-8443}"
@@ -333,7 +333,7 @@ preflight() {
   local f
   for f in app/static/index.html app/static/background.jpg app/requirements.txt \
            tools/rebuild_index.py tools/backup_index.py tools/clean_cache.py \
-           tools/test_search_logic.py tgpool.service; do
+           tools/show_password.py tools/test_search_logic.py tgpool.service; do
     [ -f "$SELF/$f" ] || die "部署包不完整：缺少 $f"
   done
   if [ -r /etc/os-release ]; then
@@ -582,6 +582,7 @@ step_files() {
       "tools/rebuild_index.py:$APP/tools/rebuild_index.py" \
       "tools/backup_index.py:$APP/tools/backup_index.py" \
       "tools/clean_cache.py:$APP/tools/clean_cache.py" \
+      "tools/show_password.py:$APP/tools/show_password.py" \
       "tools/test_search_logic.py:$APP/tools/test_search_logic.py" \
       "tgpool.service:$APP/tgpool.service"; do
     src="${pair%%:*}"; dst="${pair##*:}"
@@ -598,6 +599,10 @@ step_files() {
   else
     ok "$n 个文件已同步"
   fi
+  # 找回密码的小工具要能直接执行（sudo /opt/tgpool/tools/show_password.py）
+  if [ "$CHECK" = 0 ] && [ -f "$APP/tools/show_password.py" ]; then
+    chmod 755 "$APP/tools/show_password.py"
+  fi
 
   local had_env=0
   [ -f "$ENV" ] && had_env=1
@@ -612,6 +617,7 @@ step_files() {
   set_env_if_diff TG_DB_PATH     "$APP/index.db"
   set_env_if_diff TG_JOURNAL     "$APP/journal/index.jsonl"
   set_env_if_diff TG_LOCAL_ROOT  "/var/lib/telegram-bot-api"
+  set_env_if_diff TG_NGINX_PORT  "$PORT"
   set_env_if_diff TG_ENV_FILE    "$ENV"
   if [ "$CHECK" = 1 ]; then
     info "（$ENV 已核对：上面未列出的配置项均无需改动）"
@@ -1127,11 +1133,15 @@ summary() {
   printf '  网页地址   %shttps://%s:%s/%s\n' "$C_B" "$ip" "$PORT" "$C_R"
   printf '  用户名     %s\n' "$user"
   printf '  密码       %s%s%s\n' "$C_B" "$pass" "$C_R"
+  printf '\n  %s忘记密码怎么办%s\n' "$C_B" "$C_R"
+  printf '   · Telegram 里给 bot 发 %s/pass%s，账号密码直接回给你\n' "$C_B" "$C_R"
+  printf '   · 或在服务器上执行：%spython3 %s/tools/show_password.py%s\n' "$C_B" "$APP" "$C_R"
+  printf '       （后端了也能用；加 --token 连 bot token 一起看，加 --reset --yes 换个新密码）\n'
   printf '\n  %s注意事项%s\n' "$C_B" "$C_R"
   printf '   · 首次打开会提示证书不受信任（自签名），点「高级 → 继续访问」即可\n'
   printf '   · 外网打不开就去云服务商安全组放行 %s 端口\n' "$PORT"
   printf '   · 别用 Cloudflare 域名上传：免费版会拦掉 >100MB 的请求\n'
-  printf '   · bot token 不在备份包里，请单独另存一份\n'
+  printf '   · bot token 不在备份包里，请单独另存一份（%s/tools/show_password.py --token）\n' "$APP"
   printf '   · 随时自检：%s %s/tools/rebuild_index.py --verify\n' "$APP/venv/bin/python" "$APP"
   printf '\n'
 }

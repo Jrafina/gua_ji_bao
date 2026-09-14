@@ -449,5 +449,429 @@ check("无备份记录给出提示", "还没有云端备份记录" in SENT[0][1]
       SENT[0][1].get("text"))
 A.REMOTE_LOG = _orig_log
 
+# ============================================================================
+#  v1.5 新增：/rm · /move · /pass（以及它们依赖的路径解析与批量删除）
+# ============================================================================
+import rebuild_index as R      # 与测试脚本同目录；用来验证 journal 仍能完整重放
+
+
+def TXT(text):
+    return {"chat": {"id": 8575978784}, "from": {"id": 8575978784}, "text": text}
+
+
+_UID = [8100]
+
+
+def send_doc(name, cap, size=100):
+    """走 bot 收录路径造样本（它写 journal add，重放时才对得上账）。"""
+    _UID[0] += 1
+    msg = {"chat": {"id": 8575978784}, "from": {"id": 8575978784}, "message_id": _UID[0],
+           "document": {"file_id": "MV%d" % _UID[0], "file_unique_id": "MVU%d" % _UID[0],
+                        "file_name": name, "file_size": size, "mime_type": "text/plain"}}
+    if cap:
+        msg["caption"] = cap
+    asyncio.run(A._handle_message(msg))
+    return _UID[0]
+
+
+def file_id_of(name):
+    with A.db() as c:
+        r = c.execute("SELECT id FROM files WHERE name=?", (name,)).fetchone()
+    return r["id"] if r else None
+
+
+def folder_exists(path):
+    with A.db() as c:
+        return A._resolve_path(c, path)[1] is None
+
+
+def last_text():
+    return SENT[-1][1].get("text", "")
+
+
+print("== _norm_path / _split_args ==")
+check("多斜杠与尾斜杠归一化", A._norm_path("//a//b/") == "/a/b", A._norm_path("//a//b/"))
+check("空串归一化为根", A._norm_path("") == "/")
+check("根仍是根", A._norm_path("/") == "/")
+check("单引号包住含空格的路径",
+      A._split_args("'/工作/我的 报告' /归档") == ["/工作/我的 报告", "/归档"],
+      A._split_args("'/工作/我的 报告' /归档"))
+check("双引号与中文引号混用",
+      A._split_args('"/a b" “/c d”') == ["/a b", "/c d"], A._split_args('"/a b" “/c d”'))
+check("无引号按空白切", A._split_args("/a/b    /c") == ["/a/b", "/c"])
+check("多个空格与首尾空白不产生空参数", A._split_args("  /a/b  ") == ["/a/b"])
+check("空输入得到空列表", A._split_args("") == [])
+
+print("== _resolve_node（同时认出文件与目录）==")
+with A.db() as c:
+    k, i, e = A._resolve_node(c, "/工作/2026")
+    check("目录 -> folder", k == "folder" and e is None and i is not None, (k, i, e))
+    k, i, e = A._resolve_node(c, "/工作/2026/财务报表.pdf")
+    check("文件 -> file", k == "file" and e is None and i is not None, (k, i, e))
+    k, i, e = A._resolve_node(c, "/工作/2026/财务报表.pdf", "folder")
+    check("-dir 时不认文件", k is None and bool(e), (k, e))
+    k, i, e = A._resolve_node(c, "/工作/2026", "file")
+    check("-file 时不认目录", k is None and bool(e), (k, e))
+    k, i, e = A._resolve_node(c, "/")
+    check("根 -> folder/None", k == "folder" and i is None and e is None, (k, i, e))
+    k, i, e = A._resolve_node(c, "/查无此路径")
+    check("不存在 -> 带错误信息", k is None and bool(e), (k, e))
+
+print("== /move：移动目录 ==")
+send_doc("m1.txt", "/移动源")
+send_doc("m2.txt", "/移动源/子")
+check("样本目录建好", folder_exists("/移动源/子"))
+
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/move /移动源 /归档区")))
+check("回复里给出新旧路径", "已移动文件夹" in last_text() and "/归档区/移动源" in last_text(),
+      last_text())
+check("目录真的挪了", folder_exists("/归档区/移动源/子"))
+check("原路径已消失", not folder_exists("/移动源"))
+check("目标目录不存在时自动创建并写 journal",
+      any(e.get("t") == "mkdir" and e.get("path") == "/归档区" for e in journal_events()))
+mv = [e for e in journal_events() if e.get("t") == "mvd" and e.get("path") == "/移动源"]
+check("写了 mvd 事件（灾备依赖）", len(mv) == 1 and mv[0]["new"] == "/归档区/移动源", mv)
+with A.db() as c:
+    check("目录树整体跟着走（子目录还在）", A._resolve_path(c, "/归档区/移动源/子")[1] is None)
+
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/move /归档区 /归档区/移动源")))
+check("拒绝把目录挪进它自己的子目录", "不能" in last_text(), last_text())
+
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/move /移动源 /归档区")))
+check("源不存在时给出明确提示", "路径不存在" in last_text(), last_text())
+
+print("== /move：移动文件（含带空格的路径）==")
+send_doc("带空格 文件.txt", "/含 空格")
+SENT.clear()
+asyncio.run(A._handle_message(TXT('/move "/含 空格/带空格 文件.txt" /归档区')))
+check("引号路径能被正确切分", "已移动文件" in last_text() and "/归档区/带空格 文件.txt" in last_text(),
+      last_text())
+mvf = [e for e in journal_events() if e.get("t") == "mv" and e.get("path") == "/归档区"]
+check("写了 mv 事件（灾备依赖）", len(mvf) >= 1, mvf)
+
+SENT.clear()
+asyncio.run(A._handle_message(TXT('/move "/归档区/带空格 文件.txt"')))
+check("只写源路径 = 挪到根目录", "已移动文件" in last_text() and "→  /带空格 文件.txt" in last_text(),
+      last_text())
+
+with A.db() as c:
+    check("文件确实落在根目录", A.path_of(c, c.execute(
+        "SELECT folder_id FROM files WHERE name='带空格 文件.txt'").fetchone()["folder_id"]) == "/")
+
+SENT.clear()
+asyncio.run(A._handle_message(TXT('/move "/带空格 文件.txt" /深层/一级/二级')))
+check("多级目标目录会逐级自动创建",
+      folder_exists("/深层/一级/二级") and "/深层/一级/二级/带空格 文件.txt" in last_text(),
+      last_text())
+check("自动创建时每级都写 mkdir（重建才不丢目录）",
+      all(any(e.get("t") == "mkdir" and e.get("path") == p for e in journal_events())
+          for p in ("/深层", "/深层/一级", "/深层/一级/二级")))
+check("回复里说明了自动创建的目录", "自动创建" in last_text(), last_text())
+
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/move")))
+check("/move 缺参数给出用法", "用法" in last_text(), last_text())
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/move /a /b /c")))
+check("/move 参数过多给出用法", "用法" in last_text(), last_text())
+
+print("== /rm：删文件 ==")
+fid1 = file_id_of("m1.txt")
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/rm /归档区/移动源/m1.txt")))
+check("回复已删除文件", "已删除文件" in last_text() and "无法找回" in last_text(), last_text())
+check("真的从 Telegram 侧删了消息",
+      any(m == "deleteMessages" for m, _ in SENT), [m for m, _ in SENT])
+check("索引里也没有了", file_id_of("m1.txt") is None)
+check("写了 del 事件", any(e.get("t") == "del" and e.get("id") == fid1
+                          for e in journal_events()))
+
+m2id = file_id_of("m2.txt")
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/rm #%d" % m2id)))
+check("/rm #编号 也能删", "已删除文件" in last_text() and file_id_of("m2.txt") is None, last_text())
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/rm #999999")))
+check("编号不存在给出提示", "不存在" in last_text(), last_text())
+
+print("== /rm：删目录（先确认，再动手）==")
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/rm /归档区/移动源")))
+t = last_text()
+kb = (SENT[-1][1].get("reply_markup") or {}).get("inline_keyboard", [])
+btns = {b["callback_data"]: b["text"] for row in kb for b in row}
+check("先要确认，且给出内容清单",
+      "要删除整个文件夹吗" in t and "个子目录" in t and len(btns) == 2, (t, btns))
+check("确认前什么都还没删", folder_exists("/归档区/移动源") and len(A.RM_PENDING) == 1,
+      len(A.RM_PENDING))
+
+tok = [k for k in btns if k.startswith("r:")][0].split(":")[1]
+SENT.clear()
+asyncio.run(A._handle_callback({"id": "RC1", "from": {"id": 8575978784},
+                                "data": "r:%s:n" % tok,
+                                "message": {"message_id": 777, "chat": {"id": 8575978784}}}))
+check("点取消后目录还在", folder_exists("/归档区/移动源"))
+check("点取消后有反馈", any(m in ("editMessageText", "sendMessage") for m, _ in SENT),
+      [m for m, _ in SENT])
+check("取消后确认记录被清掉", A.RM_PENDING == {}, A.RM_PENDING)
+
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/rm /归档区/移动源")))
+tok = list(A.RM_PENDING)[0]
+SENT.clear()
+asyncio.run(A._handle_callback({"id": "RC2", "from": {"id": 8575978784},
+                                "data": "r:%s:y" % tok,
+                                "message": {"message_id": 778, "chat": {"id": 8575978784}}}))
+check("确认后目录没了", not folder_exists("/归档区/移动源"))
+check("就地改写那条确认消息（不再多发一条）",
+      [m for m, _ in SENT if m in ("editMessageText", "sendMessage")][-1] == "editMessageText",
+      [m for m, _ in SENT])
+check("写了 rmd 事件（灾备依赖）",
+      any(e.get("t") == "rmd" and e.get("path") == "/归档区/移动源" for e in journal_events()))
+check("确认按钮一次性（不能重复删）", A.RM_PENDING == {}, A.RM_PENDING)
+
+SENT.clear()
+asyncio.run(A._handle_callback({"id": "RC3", "from": {"id": 8575978784},
+                                "data": "r:deadbeef:y",
+                                "message": {"message_id": 779, "chat": {"id": 8575978784}}}))
+check("过期/伪造的确认不会删东西",
+      any(m == "answerCallbackQuery" and "失效" in (p.get("text") or "") for m, p in SENT),
+      [(m, p.get("text")) for m, p in SENT])
+
+print("== /rm：-f 与路径里的空格 ==")
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/rm /含 空格")))
+check("含空格的路径不加引号会被当两个参数（给用法提示）",
+      "用法" in last_text() and folder_exists("/含 空格"), last_text())
+SENT.clear()
+asyncio.run(A._handle_message(TXT('/rm -f "/含 空格"')))
+check("-f 加引号直接删掉，不再确认",
+      "已删除文件夹" in last_text() and not folder_exists("/含 空格") and A.RM_PENDING == {},
+      last_text())
+
+print("== /rm：根目录保护与同名文件/目录 ==")
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/rm /")))
+check("根目录拒绝删除", "根目录不能删" in last_text(), last_text())
+
+send_doc("同名", "/")                       # 根目录下一个叫「同名」的文件
+with A.db() as c:
+    A._ensure_folder_path(c, "/同名")        # 再来一个同名目录
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/rm /同名")))
+check("同名时默认当目录处理，并提示清楚",
+      "要删除整个文件夹吗" in last_text() and "同名文件" in last_text(), last_text())
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/rm -file /同名")))
+check("-file 只删文件", "已删除文件" in last_text() and file_id_of("同名") is None, last_text())
+check("同名目录没被连坐", folder_exists("/同名"))
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/rm -f -dir /同名")))
+check("-dir 删掉剩下的空目录", "已删除文件夹" in last_text() and not folder_exists("/同名"),
+      last_text())
+
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/rm")))
+check("/rm 缺参数给出用法", "用法" in last_text(), last_text())
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/rm /查无此路径")))
+check("/rm 路径不存在给出提示", "路径不存在" in last_text(), last_text())
+
+print("== /pass：忘记密码时把账号密码捞回来 ==")
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/pass")))
+t = last_text()
+kb = (SENT[-1][1].get("reply_markup") or {}).get("inline_keyboard", [])
+check("回复里有账号", "admin" in t, t)
+check("回复里有密码（TG_AUTH_PASS=test）", "test" in t, t)
+check("带上网页地址与端口", "https://" in t and ":8443" in t, t)
+check("告诉用户在服务器上怎么查", "show_password.py" in t, t)
+check("带一键删除按钮", any(b.get("callback_data") == "q" for row in kb for b in row), kb)
+SENT.clear()
+asyncio.run(A._handle_callback({"id": "RCQ", "from": {"id": 8575978784}, "data": "q",
+                                "message": {"message_id": 780, "chat": {"id": 8575978784}}}))
+check("点按钮能删掉这条含密码的消息",
+      any(m == "deleteMessage" and p.get("message_id") == 780 for m, p in SENT),
+      [(m, p) for m, p in SENT])
+
+A.SHOW_PASS = False
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/pass")))
+check("TG_BOT_SHOW_PASS=0 时不回密码", "TG_BOT_SHOW_PASS" in last_text(), last_text())
+A.SHOW_PASS = True
+
+SENT.clear()
+asyncio.run(A._handle_message({"chat": {"id": 999999}, "from": {"id": 999999},
+                               "text": "/pass"}))
+check("未授权会话连密码也问不到", SENT == [], SENT)
+
+print("== 批量删除消息 ==")
+SENT.clear()
+n = asyncio.run(A._tg_delete_messages(8575978784, list(range(1, 251))))
+calls = [p for m, p in SENT if m == "deleteMessages"]
+check("250 条拆成 100/100/50 三批",
+      [len(c["message_ids"]) for c in calls] == [100, 100, 50],
+      [len(c["message_ids"]) for c in calls])
+check("返回确认删除的条数", n == 250, n)
+SENT.clear()
+n0 = asyncio.run(A._tg_delete_messages(8575978784, [None, 0, ""]))
+check("空 message_id 不发请求", SENT == [] and n0 == 0, (SENT, n0))
+
+
+async def no_batch(method, **params):
+    SENT.append((method, params))
+    if method == "deleteMessages":
+        return {"ok": False, "description": "Bad Request: method not found"}
+    return {"ok": True, "result": True}
+
+
+A._tg = no_batch
+SENT.clear()
+n2 = asyncio.run(A._tg_delete_messages(1, [11, 12]))
+check("批量接口不可用时退回逐条 deleteMessage",
+      [m for m, _ in SENT] == ["deleteMessages", "deleteMessage", "deleteMessage"] and n2 == 2,
+      [m for m, _ in SENT])
+A._tg = fake_tg
+
+print("== 命令分发：/rm /move /pass ==")
+for t in ("/rm", "/move", "/pass"):
+    SENT.clear()
+    asyncio.run(A._handle_message(TXT(t + "@tgpool_bot")))
+    check("%s@botname 能识别" % t, len(SENT) == 1, SENT)
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/mv /归档区 /归档区2")))
+check("/mv 是 /move 的别名", "已移动文件夹" in last_text(), last_text())
+SENT.clear()
+asyncio.run(A._handle_message(TXT("/help")))
+check("帮助里列出了新命令",
+      all(x in last_text() for x in ("/rm", "/move", "/pass")), last_text()[:200])
+
+print("== journal 重放：/rm 与 /move 写的事件必须能被完整重放 ==")
+folders_r, files_r, stat_r = R.replay(A.JOURNAL)
+cur_folders, cur_files = R.read_db(A.DB_PATH)
+check("journal 没有解析不了的行", stat_r["bad"] == 0, stat_r)
+check("journal 没有未知事件", stat_r["unknown"] == 0, stat_r)
+check("事件类型齐全（mkdir/add/mv/mvd/del/rmd）",
+      {"mkdir", "add", "mv", "mvd", "del", "rmd"} <= set(stat_r["kinds"]), stat_r["kinds"])
+check("重放出的目录都存在于现库", set(folders_r) <= set(cur_folders),
+      sorted(set(folders_r) - set(cur_folders))[:8])
+bad = []
+for i, r in files_r.items():
+    lv = cur_files.get(i)
+    if not lv or (lv["name"], lv["_path"]) != (r["name"], r["_path"]):
+        bad.append((i, r["_path"], lv and lv["_path"]))
+check("重放出的文件路径与现库逐条一致（删掉/挪走的都对得上）", not bad, bad[:5])
+check("已删除的文件不在重放结果里",
+      not any(r["name"] == "m1.txt" for r in files_r.values()),
+      [r["name"] for r in files_r.values() if r["name"] == "m1.txt"])
+check("带空格的文件重放后落在最后一次移动的目录",
+      any(r["name"] == "带空格 文件.txt" and r["_path"] == "/深层/一级/二级"
+          for r in files_r.values()),
+      [(r["name"], r["_path"]) for r in files_r.values() if "带空格" in r["name"]])
+
+print("== tools/show_password.py：服务器上找回密码 ==")
+import re
+import subprocess
+
+SCRIPT = Path(__file__).resolve().parent / "show_password.py"
+envdir = TMP / "envtest"
+envdir.mkdir(parents=True, exist_ok=True)
+envfile = envdir / "tgpool.env"
+envfile.write_text("TG_AUTH_USER=admin\nTG_AUTH_PASS=S3cret-Pass-42\n"
+                   "TG_NGINX_PORT=8443\nTG_BOT_TOKEN=999:ZZZ\n", encoding="utf-8")
+
+
+def run_script(*args):
+    p = subprocess.run([sys.executable, str(SCRIPT), "--env-file", str(envfile), *args],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
+rc, out = run_script()
+check("脚本存在且能正常退出", SCRIPT.is_file() and rc == 0, (SCRIPT, rc, out[:200]))
+check("打印出账号", "admin" in out, out[:200])
+check("打印出密码", "S3cret-Pass-42" in out, out[:200])
+check("默认不打印 bot token", "999:ZZZ" not in out, out[:200])
+
+rc, out = run_script("--token")
+check("--token 才打印 token", "999:ZZZ" in out, out[:200])
+
+rc, out = run_script("--json")
+data = json.loads(out)
+check("--json 可解析且账号密码正确",
+      data["user"] == "admin" and data["password"] == "S3cret-Pass-42", data)
+check("--json 带出网页地址", data["url"].startswith("https://") and ":8443" in data["url"], data)
+
+rc, out = run_script("--port", "9999")
+check("--port 能覆盖端口", ":9999" in out, out[:200])
+
+rc, out = run_script("--reset")
+check("--reset 不带 --yes 时只提示、不改文件",
+      "S3cret-Pass-42" in envfile.read_text(encoding="utf-8"), rc)
+rc, out = run_script("--reset", "--yes")
+newenv = envfile.read_text(encoding="utf-8")
+m = re.search(r"^TG_AUTH_PASS=(\S+)$", newenv, re.M)
+baks = list(envdir.glob("tgpool.env.bak-*"))
+check("--reset --yes 换成新的 16 位密码",
+      rc == 0 and bool(m) and m.group(1) != "S3cret-Pass-42" and len(m.group(1)) == 16,
+      (rc, m and m.group(1)))
+check("改之前自动备份了原文件",
+      bool(baks) and "S3cret-Pass-42" in baks[0].read_text(encoding="utf-8"), baks)
+check("reset 不动别的配置项", "TG_BOT_TOKEN=999:ZZZ" in newenv, newenv)
+
+print("== 网页端删除接口（delete_messages 改造后回归）==")
+from fastapi.testclient import TestClient
+
+AUTH = ("admin", "test")
+A._tg = fake_tg
+with TestClient(A.app) as cl:
+    r = cl.get("/api/stats")
+    check("未带凭据一律 401", r.status_code == 401, r.status_code)
+    r = cl.get("/api/stats", auth=AUTH)
+    check("带凭据可读统计",
+          r.status_code == 200 and "count" in r.json(), (r.status_code, r.text[:120]))
+
+    r = cl.post("/api/folders", json={"name": "网页删", "parent_id": None}, auth=AUTH)
+    check("新建目录成功", r.status_code == 200, (r.status_code, r.text[:120]))
+    wid = r.json()["id"]
+    r = cl.post("/api/folders", json={"name": "子", "parent_id": wid}, auth=AUTH)
+    sub = r.json()["id"]
+    with A.db() as c:
+        c.execute("INSERT INTO files(name,size,mime,file_id,message_id,chat_id,folder_id,"
+                  "created_at) VALUES(?,?,?,?,?,?,?,?)",
+                  ("web-del.txt", 10, "text/plain", "WF1", 4321, "8575978784", sub, 1))
+        c.commit()
+        wfid = c.execute("SELECT id FROM files WHERE file_id='WF1'").fetchone()["id"]
+
+    r = cl.delete("/api/folders/%d" % wid, auth=AUTH)
+    check("非空目录默认拒绝（需 force）", r.status_code == 409, (r.status_code, r.text[:120]))
+
+    SENT.clear()
+    r = cl.delete("/api/folders/%d?force=true" % wid, auth=AUTH)
+    check("force 递归删除成功",
+          r.status_code == 200 and r.json()["deleted_files"] == 1, (r.status_code, r.text[:160]))
+    check("网页删除也走批量 deleteMessages",
+          any(m == "deleteMessages" for m, _ in SENT), [m for m, _ in SENT])
+    check("网页删除写了 journal rmd",
+          any(e.get("t") == "rmd" and e.get("path") == "/网页删" for e in journal_events()))
+
+    with A.db() as c:
+        c.execute("INSERT INTO files(name,size,mime,file_id,message_id,chat_id,folder_id,"
+                  "created_at) VALUES(?,?,?,?,?,?,?,?)",
+                  ("web-del2.txt", 11, "text/plain", "WF2", 4322, "8575978784", None, 1))
+        c.commit()
+        wfid2 = c.execute("SELECT MAX(id) m FROM files").fetchone()["m"]
+    SENT.clear()
+    r = cl.delete("/api/files/%d" % wfid2, auth=AUTH)
+    check("删单个文件成功", r.status_code == 200, (r.status_code, r.text[:120]))
+    check("单文件也删了 Telegram 侧消息",
+          any(m == "deleteMessages" and p.get("message_ids") == [4322] for m, p in SENT),
+          [(m, p.get("message_ids")) for m, p in SENT])
+    check("单文件删除也写了 journal del",
+          any(e.get("t") == "del" and e.get("id") == wfid2 for e in journal_events()))
+
 print(f"\n结果：PASS {PASS} / FAIL {FAIL}")
 sys.exit(1 if FAIL else 0)

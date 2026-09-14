@@ -78,10 +78,13 @@ bash /root/tgpool-deploy/deploy.sh
 ### 第 5 步 · 验收
 
 浏览器打开 `https://<新IP>:8443/`，用 `admin` + 密码登录
-（密码在 `deploy.sh` 结尾打印过，也可 `grep TG_AUTH_PASS /opt/tgpool/tgpool.env`），
-确认文件数 / 目录数与备份包一致。
+（密码在 `deploy.sh` 结尾打印过，忘了就 `python3 /opt/tgpool/tools/show_password.py`，
+或直接在 Telegram 里发 `/pass`），确认文件数 / 目录数与备份包一致。
 
 完整验收清单见 [REBUILD.md](REBUILD.md) 第 12 节。
+
+> **密码是每台机器各自生成的**：`tgpool.env` 故意不进备份包（里面有 bot token 等凭据）。
+> 所以重建出来的新机器密码是**新随机密码**，和旧机器不一样 —— 用上面两条命令随时能查到。
 
 ---
 

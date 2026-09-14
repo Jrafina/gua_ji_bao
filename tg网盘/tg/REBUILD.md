@@ -157,10 +157,14 @@ bash /opt/tgpool-setup/init_webapp.sh
 **记下新的访问密码**：
 
 ```bash
-grep TG_AUTH_PASS /opt/tgpool/tgpool.env
+python3 /opt/tgpool/tools/show_password.py        # 账号 / 密码 / 访问地址一起打出来
+# 或者：grep TG_AUTH_PASS /opt/tgpool/tgpool.env
 ```
 
-> 想沿用旧密码（`PGEHzEbbqLpwKlj3`），就直接改这一行；不想留旧密码就用新生成的。**这个密码之后要输进浏览器，别弄丢。**
+> 新机器上是**新随机生成的 16 位密码**，和旧机器不一样（`tgpool.env` 里还有 bot token
+> 等凭据，故意不进备份包）。随时忘了就再跑一次上面这行，或在 Telegram 里给 bot 发 `/pass`；
+> 想换一个：`python3 /opt/tgpool/tools/show_password.py --reset --yes` 然后 `systemctl restart tgpool`。
+> **这个密码之后要输进浏览器，别弄丢。**
 
 ---
 

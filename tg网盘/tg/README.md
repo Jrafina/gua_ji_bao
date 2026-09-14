@@ -83,14 +83,17 @@ GET    /api/bot/status             机器人命令诊断（token 是否有效、
 
 ## 聊天命令（在 Telegram 里 /search 查文件）
 
-不用打开网页，直接给 @storage_pool_bot 发命令就能查池子。
+不用打开网页，直接给 @storage_pool_bot 发命令就能查池子、整理目录。
 
 ```
 /search 关键词   模糊搜索：文件名或所在路径包含关键词即命中
 /ls [路径]       列出目录内容，省略路径则列根目录
 /get 编号        按编号取回文件
+/move 源 目标    移动文件或文件夹，目标留空 = 挪到根目录
+/rm 路径         删除文件；删文件夹先确认再动手
 /backups         列出云端索引备份包，点编号即可取回
 /stats           池子统计
+/pass            忘记网页密码时把账号密码捞回来
 /help            命令帮助
 ```
 
@@ -124,6 +127,53 @@ GET    /api/bot/status             机器人命令诊断（token 是否有效、
 Telegram 会话作为**异地灾备副本**。这些包是基础设施，**刻意不进池子索引**——否则在网页或
 bot 里删它等于删掉异地副本。`/backups` 读备份注册表（`backup/remote.jsonl`）列出最近 14 份，
 点编号即用 `copyMessage` 零带宽把备份包复制回对话；拿到包后按灾备文档恢复即可。
+
+### `/rm`：在聊天里删文件 / 删目录
+
+```
+/rm /工作/2026/报表.pdf    删一个文件
+/rm /工作/2026             删整个文件夹（含里面所有文件）
+/rm #1234                  按编号删（编号来自 /ls、/search 的 #数字）
+/rm -f /工作/2026          跳过确认直接删
+/rm -file /同名            只删文件（同名文件和文件夹并存时才需要）
+```
+
+- **删文件夹一定先确认**：bot 会把目录路径、子目录数、文件数、总容量列出来，点「确认删除」才动手
+  （按钮 10 分钟内有效、点一次就失效）。手滑发错路径不会直接毁数据。
+- 删的是**真删除**：Telegram 上的原消息和索引一起清掉，无法找回。所以宁可多点一下。
+- 根目录不可删；同名文件和文件夹同时存在时默认按**文件夹**处理，回复里会写明，要删文件加 `-file`。
+- 删除同样写 journal（`del` / `rmd` 事件），与网页端删除完全一致——**索引依然可以从日志完整重建**。
+- 路径里含空格就用引号包起来：`/rm "/我的 报告/最终版.docx"`。
+
+### `/move`：在聊天里挪文件 / 挪目录
+
+```
+/move /工作/2026 /归档      把 /工作/2026 挪到 /归档 下
+/move /报表模板.docx /模板   移动单个文件
+/move "/我的 报告"           只写源路径 = 挪到根目录
+```
+
+- 源可以是文件或文件夹，**目标目录不存在会自动逐级创建**（和发文件时写路径的规矩一致）；
+- 拒绝把文件夹挪进它自己或它的子目录（循环）；
+- 同层已有同名文件夹时会拒绝并提示，不会静默覆盖；
+- 移动写 journal（`mvd` / `mv` 事件），重建索引后目录结构照样一致。
+
+### `/pass`：忘记网页密码
+
+```
+/pass   →  外网地址 / 本机地址 / 账号 / 密码
+```
+
+密码存在服务器 `/opt/tgpool/tgpool.env`（权限 600），只有 root 能读，也不在备份包里。
+忘了密码有三条路，任选：
+
+1. Telegram 里发 `/pass`（消息里带一个「删掉这条消息」按钮，看完可以直接清掉）；
+2. 服务器上执行 `python3 /opt/tgpool/tools/show_password.py`
+   （后端了也能用；`--token` 连 bot token 一起看，`--json` 给脚本用）；
+3. 干脆换一个：`python3 /opt/tgpool/tools/show_password.py --reset --yes`
+   （原文件自动备份成 `tgpool.env.bak-<时间>`，改完 `systemctl restart tgpool` 生效）。
+
+介意密码出现在聊天记录里的话，在 `tgpool.env` 里设 `TG_BOT_SHOW_PASS=0` 关掉 `/pass`。
 
 ### 直接发文件给 bot 即可收录（反向上传）
 
@@ -468,7 +518,8 @@ cd /opt/tgpool
 │   ├── rebuild_index.py       ★ 从 journal 重建 / 校验 / 恢复索引
 │   ├── backup_index.py        ★ 备份（本地 + 上传 Telegram）/ 取回
 │   ├── clean_cache.py         bot API 缓存清理（定时任务与网页按钮共用）
-│   └── test_search_logic.py   搜索与聊天命令的离线自测（93 项，不联网）
+│   ├── show_password.py       找回 / 重设网页登录密码（读 tgpool.env）
+│   └── test_search_logic.py   搜索与聊天命令的离线自测（196 项，不联网）
 ├── journal/index.jsonl        ★ 追加式变更日志（灾备核心，勿删）
 ├── backup/                    本地备份包 + remote.jsonl（远程备份记录）
 ├── venv/                      Python 虚拟环境
@@ -507,6 +558,8 @@ cd /opt/tgpool
 | `TG_BOT_ADMIN_IDS` | 额外允许使用命令的用户 ID，逗号分隔（`TG_CHAT_ID` 始终允许） |
 | `TG_BOT_OFFSET` | `getUpdates` 游标文件路径（默认 `/opt/tgpool/tg_offset.json`） |
 | `TG_BOT_INBOX` | 直接发文件给 bot 时的默认目录名（默认 `收件箱`） |
+| `TG_BOT_SHOW_PASS` | 是否允许 `/pass` 在聊天里回网页密码（默认 `1`，设 `0` 关闭） |
+| `TG_NGINX_PORT` | 对外 HTTPS 端口（部署脚本自动写入，`/pass` 用它拼网页地址） |
 
 修改后执行 `systemctl restart tgpool` 生效。
 
@@ -541,6 +594,26 @@ du -sh /var/lib/telegram-bot-api
 # 每日备份日志
 tail -20 /var/log/tgpool-backup.log
 ```
+
+### 忘记网页密码怎么办
+
+三条路，任选一条（都不需要联网）：
+
+```bash
+# 1) 在服务器上直接看（推荐；连 bot token 也能一起看）
+python3 /opt/tgpool/tools/show_password.py
+python3 /opt/tgpool/tools/show_password.py --token      # 附带 bot token（灾备重建要用）
+python3 /opt/tgpool/tools/show_password.py --json       # 脚本可读
+
+# 2) 换一个新密码（原文件自动备份成 tgpool.env.bak-<时间戳>）
+python3 /opt/tgpool/tools/show_password.py --reset --yes
+systemctl restart tgpool
+
+# 3) Telegram 里给 bot 发 /pass
+```
+
+`show_password.py` 是纯标准库脚本，系统自带的 `python3` 就能跑，服务挂了也不影响它；
+密码存在 `/opt/tgpool/tgpool.env`（权限 600），所以要用 root 执行。
 
 ---
 
@@ -687,6 +760,13 @@ f-string 表达式内**不能包含反斜杠**（3.12+ 才允许）。需先算�
    `/ls`：`/ls 文件路径`列出文件目录，省略则是根目录
 
    `/get`：`/get 编号`按编号取回文件
+
+   `/move`：`/move 源路径 目标文件夹`移动文件或文件夹，只写源路径则挪到根目录
+
+   `/rm`：`/rm 路径`删文件；`/rm 文件夹路径`删整个文件夹（先弹出确认按钮）；
+   按编号删用 `/rm #1234`；不想确认加 `-f`
+
+   `/pass`：忘记网页账号密码时发它，bot 直接把账号密码回给你
 
    `/stats`：池子统计
 
